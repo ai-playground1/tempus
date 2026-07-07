@@ -13,7 +13,9 @@ import com.cappielloantonio.tempo.repository.QueueRepository
 import com.cappielloantonio.tempo.util.Constants
 import com.cappielloantonio.tempo.util.ConstantsAA
 import com.cappielloantonio.tempo.util.MappingUtil
+import android.os.SystemClock
 import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.FutureCallback
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
@@ -21,6 +23,31 @@ import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "MediaLibrarySessionCallback"
 private val queueSourceCache = ConcurrentHashMap<String, List<MediaItem>>()
+
+// The system Bluetooth stack serves AVRCP folder browsing (car head units) by
+// opening a fresh MediaBrowser connection per folder request and waiting at
+// most 3 seconds for the children (BrowsedPlayerWrapper.SUBSCRIPTION_TIMEOUT_MS
+// on Android 13+; older stacks wait forever and wedge). Every level below the
+// root tabs is a Subsonic network call, so without a cache the car regularly
+// gets an empty folder back. Cache successful listings and serve them to the
+// Bluetooth stack immediately; Android Auto keeps getting fresh data.
+private val BLUETOOTH_STACK_PACKAGES = setOf(
+    "com.android.bluetooth",
+    "com.google.android.bluetooth"
+)
+
+// Folders answered from the in-memory tree; caching them would only risk
+// staleness after the user re-configures tabs, without making anything faster.
+private val IN_MEMORY_PARENT_IDS = setOf(
+    ConstantsAA.ROOT_ID,
+    ConstantsAA.HOME_ID,
+    ConstantsAA.MADE_FOR_YOU_ID,
+    ConstantsAA.STARRED_BUNDLE_ID,
+    ConstantsAA.TRACKS_ID
+)
+
+private const val BROWSE_CACHE_TTL_MS = 10 * 60 * 1000L
+private const val BT_PREFETCH_THROTTLE_MS = 5 * 60 * 1000L
 
 @UnstableApi
 class MediaLibrarySessionCallback(
@@ -30,6 +57,15 @@ class MediaLibrarySessionCallback(
 ) : BaseSessionCallback(context, service) {
     init {
         MediaBrowserTree.initialize(context, automotiveRepository)
+    }
+
+    private class CachedChildren(val timestampMs: Long, val items: ImmutableList<MediaItem>)
+
+    private val browseCache = ConcurrentHashMap<String, CachedChildren>()
+    private var lastBluetoothPrefetchMs = 0L
+
+    private fun isBluetoothBrowser(browser: MediaSession.ControllerInfo): Boolean {
+        return browser.packageName in BLUETOOTH_STACK_PACKAGES
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -42,6 +78,7 @@ class MediaLibrarySessionCallback(
         params: MediaLibraryService.LibraryParams?
     ): ListenableFuture<LibraryResult<MediaItem>> {
         MediaBrowserTree.buildTree()
+        if (isBluetoothBrowser(browser)) prefetchForBluetooth()
         return Futures.immediateFuture(LibraryResult.ofItem(MediaBrowserTree.getRootItem(), params))
     }
 
@@ -53,15 +90,110 @@ class MediaLibrarySessionCallback(
         pageSize: Int,
         params: MediaLibraryService.LibraryParams?
     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-        val future = MediaBrowserTree.getChildren(parentId)
-
         Log.d(TAG, "onGetChildren parentId = $parentId")
+
+        val bluetooth = isBluetoothBrowser(browser)
+        if (bluetooth) {
+            browseCache[parentId]?.let { cached ->
+                if (SystemClock.elapsedRealtime() - cached.timestampMs < BROWSE_CACHE_TTL_MS) {
+                    Log.d(TAG, "onGetChildren: serving cached children to Bluetooth for $parentId")
+                    queueSourceCache[ConstantsAA.QUEUE_CACHED_SOURCE] = cached.items
+                    return Futures.immediateFuture(
+                        LibraryResult.ofItemList(stripArtworkUris(cached.items), params)
+                    )
+                }
+            }
+        }
+
+        val future = fetchChildrenAndCache(parentId)
 
         return Futures.transform(future, { result ->
             val items = result.value ?: emptyList()
             queueSourceCache[ConstantsAA.QUEUE_CACHED_SOURCE] = items
+            if (bluetooth && result.resultCode == LibraryResult.RESULT_SUCCESS) {
+                // The Bluetooth stack resolves each item's icon URI synchronously
+                // through our AlbumArtContentProvider (a network download per item)
+                // inside its own response window when cover-art-over-URI is enabled
+                // (audio_util.Image), so browse lists must not carry artwork URIs.
+                LibraryResult.ofItemList(stripArtworkUris(items), params)
+            } else {
+                result
+            }
+        }, MoreExecutors.directExecutor())
+    }
+
+    private fun fetchChildrenAndCache(
+        parentId: String
+    ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+        val future = MediaBrowserTree.getChildren(parentId)
+        return Futures.transform(future, { result ->
+            val items = result.value
+            if (result.resultCode == LibraryResult.RESULT_SUCCESS &&
+                !items.isNullOrEmpty() &&
+                parentId !in IN_MEMORY_PARENT_IDS
+            ) {
+                browseCache[parentId] = CachedChildren(SystemClock.elapsedRealtime(), items)
+            }
             result
         }, MoreExecutors.directExecutor())
+    }
+
+    private fun stripArtworkUris(items: List<MediaItem>): ImmutableList<MediaItem> {
+        return ImmutableList.copyOf(items.map { item ->
+            if (item.mediaMetadata.artworkUri == null) item
+            else item.buildUpon()
+                .setMediaMetadata(item.mediaMetadata.buildUpon().setArtworkUri(null).build())
+                .build()
+        })
+    }
+
+    /**
+     * Warms the browse cache when the Bluetooth stack connects, so the folders a
+     * car requests first are answered within the stack's 3-second budget. Kept
+     * deliberately small: the root tabs plus the playlist list.
+     */
+    private fun prefetchForBluetooth() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastBluetoothPrefetchMs < BT_PREFETCH_THROTTLE_MS) return
+        lastBluetoothPrefetchMs = now
+
+        Log.d(TAG, "prefetchForBluetooth: warming browse cache")
+        Futures.addCallback(
+            MediaBrowserTree.getChildren(ConstantsAA.ROOT_ID),
+            object : FutureCallback<LibraryResult<ImmutableList<MediaItem>>> {
+                override fun onSuccess(result: LibraryResult<ImmutableList<MediaItem>>) {
+                    result.value.orEmpty()
+                        .filter { it.mediaMetadata.isBrowsable == true }
+                        .forEach { warmChildren(it.mediaId) }
+                    warmChildren(ConstantsAA.PLAYLIST_ID)
+                }
+
+                override fun onFailure(t: Throwable) {
+                    Log.w(TAG, "prefetchForBluetooth: root fetch failed", t)
+                }
+            },
+            MoreExecutors.directExecutor()
+        )
+    }
+
+    private fun warmChildren(parentId: String) {
+        if (parentId in IN_MEMORY_PARENT_IDS) return
+        browseCache[parentId]?.let { cached ->
+            if (SystemClock.elapsedRealtime() - cached.timestampMs < BROWSE_CACHE_TTL_MS) return
+        }
+        Futures.addCallback(
+            fetchChildrenAndCache(parentId),
+            object : FutureCallback<LibraryResult<ImmutableList<MediaItem>>> {
+                override fun onSuccess(result: LibraryResult<ImmutableList<MediaItem>>) {
+                    Log.d(TAG, "warmChildren: $parentId -> ${result.value?.size ?: 0} items")
+                }
+
+                override fun onFailure(t: Throwable) {
+                    Log.w(TAG, "warmChildren: $parentId failed", t)
+                }
+            },
+            MoreExecutors.directExecutor()
+        )
     }
 
     // ─────────────────────────────────────────────────────────────
