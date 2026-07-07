@@ -344,7 +344,12 @@ public class AutomotiveRepository {
     public ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> getRecentlyPlayedSongs(String server, int count) {
         final SettableFuture<LibraryResult<ImmutableList<MediaItem>>> listenableFuture = SettableFuture.create();
 
-        chronologyDao.getLastPlayed(server, count).observeForever(new Observer<List<Chronology>>() {
+        // Keep a single LiveData instance: calling getLastPlayed() again returns a new
+        // LiveData, so removing the observer from a fresh instance leaked the original
+        // observer (and its Room subscription) on every browse of "recently played".
+        final androidx.lifecycle.LiveData<List<Chronology>> lastPlayed =
+                chronologyDao.getLastPlayed(server, count);
+        lastPlayed.observeForever(new Observer<List<Chronology>>() {
             @Override
             public void onChanged(List<Chronology> chronology) {
                 if (chronology != null && !chronology.isEmpty()) {
@@ -361,7 +366,7 @@ public class AutomotiveRepository {
                     listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                 }
 
-                chronologyDao.getLastPlayed(server, count).removeObserver(this);
+                lastPlayed.removeObserver(this);
             }
         });
 
@@ -597,6 +602,11 @@ public class AutomotiveRepository {
                             LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
 
                             listenableFuture.set(libraryResult);
+                        } else {
+                            // Always resolve the future: a pending browse subscription that is
+                            // never answered stalls Bluetooth AVRCP browsing (the stack waits for
+                            // a result and wedges/timeouts) and leaves car head units hanging.
+                            listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                         }
                     }
 
@@ -648,6 +658,8 @@ public class AutomotiveRepository {
                             LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
 
                             listenableFuture.set(libraryResult);
+                        } else {
+                            listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                         }
                     }
 
@@ -782,26 +794,30 @@ public class AutomotiveRepository {
                             List<InternetRadioStation> radioStations = new ArrayList<>(response.body().getSubsonicResponse().getInternetRadioStations().getInternetRadioStations());
 
                             new Thread(() -> {
-                                List<InternetRadioStationCache> localCaches = AppDatabase.getInstance().internetRadioStationDao().getLocal();
-                                for (InternetRadioStationCache cache : localCaches) {
-                                    radioStations.add(cache.toInternetRadioStation());
+                                try {
+                                    List<InternetRadioStationCache> localCaches = AppDatabase.getInstance().internetRadioStationDao().getLocal();
+                                    for (InternetRadioStationCache cache : localCaches) {
+                                        radioStations.add(cache.toInternetRadioStation());
+                                    }
+
+                                    radioStations.sort(java.util.Comparator.comparing(
+                                            station -> station.getName() == null ? "" : station.getName(),
+                                            String.CASE_INSENSITIVE_ORDER));
+
+                                    List<MediaItem> mediaItems = new ArrayList<>();
+
+                                    for (InternetRadioStation radioStation : radioStations) {
+                                        mediaItems.add(MappingUtil.mapInternetRadioStation(radioStation));
+                                    }
+
+                                    setInternetRadioStationsMetadata(radioStations);
+
+                                    LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
+
+                                    listenableFuture.set(libraryResult);
+                                } catch (Exception e) {
+                                    listenableFuture.setException(e);
                                 }
-
-                                radioStations.sort(java.util.Comparator.comparing(
-                                        station -> station.getName() == null ? "" : station.getName(),
-                                        String.CASE_INSENSITIVE_ORDER));
-
-                                List<MediaItem> mediaItems = new ArrayList<>();
-
-                                for (InternetRadioStation radioStation : radioStations) {
-                                    mediaItems.add(MappingUtil.mapInternetRadioStation(radioStation));
-                                }
-
-                                setInternetRadioStationsMetadata(radioStations);
-
-                                LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
-
-                                listenableFuture.set(libraryResult);
                             }).start();
                         } else {
                             listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
@@ -902,6 +918,8 @@ public class AutomotiveRepository {
                             LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
 
                             listenableFuture.set(libraryResult);
+                        } else {
+                            listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                         }
                     }
 
@@ -1017,6 +1035,8 @@ public class AutomotiveRepository {
                             LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
 
                             listenableFuture.set(libraryResult);
+                        } else {
+                            listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                         }
                     }
 
@@ -1195,6 +1215,8 @@ public class AutomotiveRepository {
                             LibraryResult<ImmutableList<MediaItem>> libraryResult = LibraryResult.ofItemList(ImmutableList.copyOf(mediaItems), null);
 
                             listenableFuture.set(libraryResult);
+                        } else {
+                            listenableFuture.set(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE));
                         }
                     }
 
