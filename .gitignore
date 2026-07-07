@@ -19,3 +19,6 @@
 tempus-release-key.jks
 app/tempus/
 app/degoogled/
+
+CURRENT_TASK.md
+*.swp
